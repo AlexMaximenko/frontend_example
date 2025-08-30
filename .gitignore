@@ -1,0 +1,18 @@
+# Node
+node_modules
+npm-debug.log
+dist
+
+# Python
+__pycache__
+*.pyc
+.venv
+
+# General
+.DS_Store
+.env
+*.sqlite3
+
+# Docker
+*.pid
+
