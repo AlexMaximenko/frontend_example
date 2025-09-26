@@ -69,7 +69,7 @@ class CFG:
     assistant_prefix: str = "Answer:"
     sample_rate: int = 16000
     max_duration_s: float = 12.0
-    n_audio_tokens: int = 12
+    audio_subsample: int = 2
     projector_hidden: int = 1024
     train_max_sft_samples: int = 2000
     val_max_sft_samples: int = 200
@@ -176,32 +176,219 @@ print("Whisper encoder hidden size:", whisper_encoder.config.d_model)
 #=== Cell 4: Define AudioProjector (in_dim = whisper d_model, out_dim = LLM hidden, N tokens)
 
 
-class AudioProjector(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, n_tokens: int = 12, hidden_dim: Optional[int] = None):
+class AudioSubsamplingProjector(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        subsample_factor: int = 2,
+        hidden_dim: Optional[int] = None,
+    ):
         super().__init__()
+        if subsample_factor < 1:
+            raise ValueError("subsample_factor must be >= 1")
+        self.subsample_factor = subsample_factor
         hidden_dim = hidden_dim or max(input_dim, output_dim)
-        self.n_tokens = n_tokens
-        self.output_dim = output_dim
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, n_tokens * output_dim),
-        )
+        self.proj_in = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.proj_out = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        pooled = encoder_hidden_states.mean(dim=1)
-        projected = self.net(pooled)
-        projected = projected.view(-1, self.n_tokens, self.output_dim)
-        return projected
+        # encoder_hidden_states: (batch, time, dim)
+        x = encoder_hidden_states
+        if self.subsample_factor > 1:
+            x = x.transpose(1, 2)
+            x = torch.nn.functional.avg_pool1d(
+                x,
+                kernel_size=self.subsample_factor,
+                stride=self.subsample_factor,
+                ceil_mode=True,
+            )
+            x = x.transpose(1, 2)
+        x = self.proj_out(self.act(self.proj_in(x)))
+        return x
 
 
-audio_projector = AudioProjector(
+audio_projector = AudioSubsamplingProjector(
     input_dim=whisper_encoder.config.d_model,
     output_dim=model.config.hidden_size,
-    n_tokens=cfg.n_audio_tokens,
+    subsample_factor=cfg.audio_subsample,
     hidden_dim=cfg.projector_hidden,
 )
 print(audio_projector)
+
+audio_llm = AudioLLMModel(
+    llm=model,
+    whisper_encoder=whisper_encoder,
+    audio_projector=audio_projector,
+    tokenizer=tokenizer,
+    audio_token=SPECIAL_AUDIO_TOKEN,
+)
+
+
+class AudioLLMModel(nn.Module):
+    def __init__(
+        self,
+        llm: AutoModelForCausalLM,
+        whisper_encoder: WhisperModel,
+        audio_projector: nn.Module,
+        tokenizer,
+        audio_token: str,
+    ):
+        super().__init__()
+        self.llm = llm
+        self.whisper_encoder = whisper_encoder
+        self.audio_projector = audio_projector
+        self.tokenizer = tokenizer
+        self.audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
+
+    def unwrap(self, module: nn.Module) -> nn.Module:
+        return getattr(module, "module", module)
+
+    def _input_embedding_layer(self):
+        return self.unwrap(self.llm).get_input_embeddings()
+
+    def encode_audio(self, input_features: torch.Tensor) -> torch.Tensor:
+        device = next(self.llm.parameters()).device
+        input_features = input_features.to(device)
+        with torch.no_grad():
+            outputs = self.whisper_encoder(input_features)
+        return outputs.last_hidden_state
+
+    def project_audio(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        projected = self.audio_projector(encoder_hidden_states)
+        embed_dtype = self._input_embedding_layer().weight.dtype
+        return projected.to(embed_dtype)
+
+    def trainable_parameters(self):
+        for module in (self.llm, self.audio_projector):
+            for param in module.parameters():
+                if param.requires_grad:
+                    yield param
+
+    def _merge_sequences(
+        self,
+        input_ids: torch.Tensor,
+        token_embeds: torch.Tensor,
+        audio_embeddings: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        batch_embeds: List[torch.Tensor] = []
+        batch_masks: List[torch.Tensor] = []
+        batch_labels: List[torch.Tensor] = [] if labels is not None else None
+
+        for idx in range(input_ids.size(0)):
+            seq_embeds: List[torch.Tensor] = []
+            seq_mask: List[torch.Tensor] = []
+            seq_labels: List[torch.Tensor] = [] if labels is not None else None
+            audio_seq = audio_embeddings[idx]
+            label_seq = labels[idx] if labels is not None else None
+            audio_inserted = False
+
+            for token_position, (token_id, embed) in enumerate(zip(input_ids[idx], token_embeds[idx])):
+                if token_id.item() == self.audio_token_id:
+                    seq_embeds.append(audio_seq)
+                    seq_mask.append(torch.ones(audio_seq.size(0), device=embed.device, dtype=torch.long))
+                    if labels is not None:
+                        seq_labels.append(
+                            torch.full((audio_seq.size(0),), -100, device=embed.device, dtype=torch.long)
+                        )
+                    audio_inserted = True
+                else:
+                    seq_embeds.append(embed.unsqueeze(0))
+                    seq_mask.append(torch.ones(1, device=embed.device, dtype=torch.long))
+                    if labels is not None:
+                        seq_labels.append(label_seq[token_position].view(1))
+
+            if not audio_inserted:
+                raise ValueError("Input sequence is missing the audio special token.")
+
+            seq_embeds_tensor = torch.cat(seq_embeds, dim=0)
+            seq_mask_tensor = torch.cat(seq_mask, dim=0)
+            batch_embeds.append(seq_embeds_tensor)
+            batch_masks.append(seq_mask_tensor)
+            if labels is not None and seq_labels is not None:
+                seq_labels_tensor = torch.cat(seq_labels, dim=0)
+                batch_labels.append(seq_labels_tensor)
+
+        padded_embeds = torch.nn.utils.rnn.pad_sequence(batch_embeds, batch_first=True)
+        padded_masks = torch.nn.utils.rnn.pad_sequence(batch_masks, batch_first=True)
+        padded_labels = None
+        if batch_labels is not None:
+            padded_labels = torch.nn.utils.rnn.pad_sequence(batch_labels, batch_first=True, padding_value=-100)
+        return padded_embeds, padded_masks, padded_labels
+
+    def prepare_inputs_and_labels(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_features = batch["input_features"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        loss_mask = batch["loss_mask"].to(device)
+
+        audio_hidden = self.encode_audio(input_features)
+        audio_embeddings = self.project_audio(audio_hidden)
+        embedding_layer = self._input_embedding_layer()
+        token_embeds = embedding_layer(input_ids)
+        labels = input_ids.clone()
+        labels[loss_mask == 0] = -100
+        inputs_embeds, attention_mask, labels = self._merge_sequences(
+            input_ids,
+            token_embeds,
+            audio_embeddings,
+            labels,
+        )
+        return inputs_embeds, attention_mask, labels
+
+    def prepare_generation_inputs(
+        self,
+        prompts: List[str],
+        audio_features: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        encoded = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        ).to(device)
+
+        audio_hidden = self.encode_audio(audio_features.to(device))
+        audio_embeddings = self.project_audio(audio_hidden)
+        token_embeds = self._input_embedding_layer()(encoded.input_ids)
+        inputs_embeds, attention_mask, _ = self._merge_sequences(
+            encoded.input_ids,
+            token_embeds,
+            audio_embeddings,
+        )
+        return inputs_embeds, attention_mask
+
+    def generate(
+        self,
+        prompts: List[str],
+        audio_features: torch.Tensor,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        generation_kwargs = generation_kwargs or {}
+        model = self.unwrap(self.llm)
+        device = next(self.llm.parameters()).device
+        inputs_embeds, attention_mask = self.prepare_generation_inputs(
+            prompts,
+            audio_features,
+            device,
+        )
+        default_kwargs = {
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        default_kwargs.update(generation_kwargs)
+        outputs = model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **default_kwargs,
+        )
+        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
 #=== Cell 5: Dataset loaders with SpokenWOZ + optional fallbacks
 
@@ -354,66 +541,11 @@ collator = SFTCollator(tokenizer, cfg)
 
 def make_inputs_embeds_and_labels(
     cfg: CFG,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
 ):
-    input_features = batch["input_features"].to(device)
-    input_ids = batch["input_ids"].to(device)
-    loss_mask = batch["loss_mask"].to(device)
-
-    with torch.no_grad():
-        whisper_outputs = whisper_encoder(input_features)
-        audio_hidden = whisper_outputs.last_hidden_state
-    audio_tokens = audio_projector(audio_hidden)
-
-    token_embeds = model.get_input_embeddings()(input_ids)
-    audio_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_AUDIO_TOKEN)
-
-    expanded_embeds = []
-    expanded_labels = []
-    expanded_masks = []
-    for b in range(input_ids.size(0)):
-        ids = input_ids[b]
-        embeds = token_embeds[b]
-        labels = ids.clone()
-        labels[loss_mask[b] == 0] = -100
-        seq_embeds = []
-        seq_labels = []
-        seq_mask = []
-        for token_id, token_embed, label in zip(ids, embeds, labels):
-            if token_id == audio_token_id:
-                for j in range(audio_projector.n_audio_tokens):
-                    seq_embeds.append(audio_tokens[b, j])
-                    seq_labels.append(torch.tensor(-100, device=device))
-                    seq_mask.append(torch.tensor(1, device=device))
-            else:
-                seq_embeds.append(token_embed)
-                seq_labels.append(label)
-                seq_mask.append(torch.tensor(1, device=device))
-        seq_embeds = torch.stack(seq_embeds)
-        seq_labels = torch.stack(seq_labels)
-        seq_mask = torch.stack(seq_mask)
-        expanded_embeds.append(seq_embeds)
-        expanded_labels.append(seq_labels)
-        expanded_masks.append(seq_mask)
-
-    max_len = max(t.size(0) for t in expanded_embeds)
-    padded_embeds, padded_labels, padded_masks = [], [], []
-    for embeds, labels, mask in zip(expanded_embeds, expanded_labels, expanded_masks):
-        pad_len = max_len - embeds.size(0)
-        if pad_len > 0:
-            embeds = torch.cat([embeds, torch.zeros((pad_len, embeds.size(1)), device=device)], dim=0)
-            labels = torch.cat([labels, torch.full((pad_len,), -100, device=device, dtype=torch.long)], dim=0)
-            mask = torch.cat([mask, torch.zeros(pad_len, device=device)], dim=0)
-        padded_embeds.append(embeds)
-        padded_labels.append(labels)
-        padded_masks.append(mask)
-
-    return torch.stack(padded_embeds), torch.stack(padded_masks), torch.stack(padded_labels)
+    return audio_model.prepare_inputs_and_labels(batch, device)
 
 
 #=== Cell 8: Training loop (loss prints every N steps)
@@ -426,7 +558,7 @@ train_loader = DataLoader(
     num_workers=cfg.num_workers,
 )
 optimizer = AdamW(
-    list(model.parameters()) + list(audio_projector.parameters()),
+    list(audio_llm.trainable_parameters()),
     lr=cfg.lr,
     weight_decay=cfg.weight_decay,
 )
@@ -436,29 +568,35 @@ scheduler = get_linear_schedule_with_warmup(
     num_warmup_steps=int(cfg.warmup_ratio * num_training_steps),
     num_training_steps=num_training_steps,
 )
-model, optimizer, train_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, scheduler)
-audio_projector = audio_projector.to(accelerator.device)
-whisper_encoder = whisper_encoder.to(accelerator.device)
+
+prepared_llm, prepared_projector, optimizer, train_loader, scheduler = accelerator.prepare(
+    audio_llm.llm,
+    audio_llm.audio_projector,
+    optimizer,
+    train_loader,
+    scheduler,
+)
+audio_llm.llm = prepared_llm
+audio_llm.audio_projector = prepared_projector
+audio_llm.whisper_encoder = audio_llm.whisper_encoder.to(accelerator.device)
+audio_llm.whisper_encoder.eval()
 
 def train_epoch(epoch: int):
-    model.train()
-    audio_projector.train()
+    audio_llm.llm.train()
+    audio_llm.audio_projector.train()
     total_loss = 0.0
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and accelerator.device.type == "cuda")
 
     for step, batch in enumerate(train_loader, start=1):
-        with accelerator.accumulate(model):
+        with accelerator.accumulate(audio_llm.llm):
             inputs_embeds, attention_mask, labels = make_inputs_embeds_and_labels(
                 cfg,
-                model,
-                tokenizer,
-                audio_projector,
-                whisper_encoder,
+                audio_llm,
                 batch,
                 accelerator.device,
             )
             with torch.cuda.amp.autocast(enabled=cfg.amp and accelerator.device.type == "cuda"):
-                outputs = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
+                outputs = audio_llm.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
                 loss = outputs.loss
             accelerator.backward(loss)
             optimizer.step()
@@ -473,16 +611,18 @@ def train_epoch(epoch: int):
 
 for epoch in range(cfg.epochs):
     avg_loss = train_epoch(epoch)
-    if accelerator.is_main_process:
-        print(f"Epoch {epoch} average loss: {avg_loss:.4f}")
+if accelerator.is_main_process:
+    print(f"Epoch {epoch} average loss: {avg_loss:.4f}")
 
 #=== Cell 9: Save adapters (PEFT dir) + audio_projector.pt
 if accelerator.is_main_process:
     adapter_dir = os.path.join(cfg.output_dir, "adapters")
     projector_path = os.path.join(cfg.output_dir, "audio_projector.pt")
     os.makedirs(adapter_dir, exist_ok=True)
-    accelerator.unwrap_model(model).save_pretrained(adapter_dir)
-    torch.save(audio_projector.state_dict(), projector_path)
+    base_model = accelerator.unwrap_model(audio_llm.llm)
+    base_model.save_pretrained(adapter_dir)
+    projector_to_save = accelerator.unwrap_model(audio_llm.audio_projector)
+    torch.save(projector_to_save.state_dict(), projector_path)
     print("Saved adapters to", adapter_dir)
     print("Saved audio projector to", projector_path)
 
@@ -490,78 +630,28 @@ if accelerator.is_main_process:
 
 def generate_from_audio_batch(
     cfg: CFG,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     audio_features: torch.Tensor,
     max_new_tokens: int = 64,
     temperature: float = 0.0,
 ):
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        whisper_outputs = whisper_encoder(audio_features.to(device))
-        audio_hidden = whisper_outputs.last_hidden_state
-    audio_tokens = audio_projector(audio_hidden)
-
     prompts = []
     for _ in range(audio_features.size(0)):
         system = cfg.system_prompt
         user = cfg.user_prompt_template.replace("<AUDIO>", SPECIAL_AUDIO_TOKEN)
         prompts.append(f"SYSTEM: {system}\nUSER: {user}\nASSISTANT:")
 
-    encoded = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        add_special_tokens=False,
-    ).to(device)
-    token_embeds = model.get_input_embeddings()(encoded.input_ids)
-    audio_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_AUDIO_TOKEN)
-
-    embeds_list = []
-    mask_list = []
-    for b in range(encoded.input_ids.size(0)):
-        ids = encoded.input_ids[b]
-        embeds = token_embeds[b]
-        seq = []
-        for token_id, token_embed in zip(ids, embeds):
-            if token_id == audio_token_id:
-                seq.append(audio_tokens[b])
-            else:
-                seq.append(token_embed.unsqueeze(0))
-        seq = torch.cat(seq, dim=0)
-        embeds_list.append(seq)
-        mask_list.append(torch.ones(seq.size(0), device=device))
-
-    max_len = max(t.size(0) for t in embeds_list)
-    padded_embeds, padded_masks = [], []
-    for embeds, mask in zip(embeds_list, mask_list):
-        pad_len = max_len - embeds.size(0)
-        if pad_len > 0:
-            embeds = torch.cat([embeds, torch.zeros((pad_len, embeds.size(1)), device=device)], dim=0)
-            mask = torch.cat([mask, torch.zeros(pad_len, device=device)], dim=0)
-        padded_embeds.append(embeds)
-        padded_masks.append(mask)
-
-    outputs = model.generate(
-        inputs_embeds=torch.stack(padded_embeds),
-        attention_mask=torch.stack(padded_masks),
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        do_sample=temperature > 0,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    return tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "do_sample": temperature > 0,
+    }
+    return audio_model.generate(prompts, audio_features, generation_kwargs)
 
 
 def evaluate_mmlu_speech(
     cfg: CFG,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     feature_extractor,
     max_samples: Optional[int] = None,
 ):
@@ -570,7 +660,6 @@ def evaluate_mmlu_speech(
         dataset = dataset.select(range(min(len(dataset), max_samples)))
 
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
-    device = next(model.parameters()).device
 
     total = 0
     correct = 0
@@ -586,13 +675,8 @@ def evaluate_mmlu_speech(
                 sampling_rate=cfg.sample_rate,
                 return_tensors="pt",
             )["input_features"][0]
-            audio_list.append(features)
-        audio_tensor = torch.stack(audio_list).to(device)
-
-        with torch.no_grad():
-            whisper_outputs = whisper_encoder(audio_tensor)
-            audio_hidden = whisper_outputs.last_hidden_state
-        audio_tokens = audio_projector(audio_hidden)
+            audio_list.append(features.to(torch.float32))
+        audio_tensor = torch.stack(audio_list)
 
         prompts = []
         prefix = "Listen to the audio question and select the correct answer (A/B/C/D). Return just the letter."
@@ -601,47 +685,11 @@ def evaluate_mmlu_speech(
                 f"SYSTEM: {cfg.system_prompt}\nUSER: {SPECIAL_AUDIO_TOKEN} {prefix} Select the correct option: A, B, C, or D. Reply with one letter.\nASSISTANT:"
             )
 
-        encoded = tokenizer(
+        texts = audio_model.generate(
             prompts,
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False,
-        ).to(device)
-        token_embeds = model.get_input_embeddings()(encoded.input_ids)
-        audio_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_AUDIO_TOKEN)
-
-        embeds_list = []
-        mask_list = []
-        for b in range(encoded.input_ids.size(0)):
-            ids = encoded.input_ids[b]
-            embeds = token_embeds[b]
-            seq = []
-            for token_id, token_embed in zip(ids, embeds):
-                if token_id == audio_token_id:
-                    seq.append(audio_tokens[b])
-                else:
-                    seq.append(token_embed.unsqueeze(0))
-            seq = torch.cat(seq, dim=0)
-            embeds_list.append(seq)
-            mask_list.append(torch.ones(seq.size(0), device=device))
-
-        max_len = max(t.size(0) for t in embeds_list)
-        padded_embeds, padded_masks = [], []
-        for embeds, mask in zip(embeds_list, mask_list):
-            pad_len = max_len - embeds.size(0)
-            if pad_len > 0:
-                embeds = torch.cat([embeds, torch.zeros((pad_len, embeds.size(1)), device=device)], dim=0)
-                mask = torch.cat([mask, torch.zeros(pad_len, device=device)], dim=0)
-            padded_embeds.append(embeds)
-            padded_masks.append(mask)
-
-        outputs = model.generate(
-            inputs_embeds=torch.stack(padded_embeds),
-            attention_mask=torch.stack(padded_masks),
-            max_new_tokens=8,
-            temperature=0.0,
+            audio_tensor,
+            {"max_new_tokens": 8, "temperature": 0.0, "do_sample": False},
         )
-        texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         answers = batch["answer"]
         subjects = batch["subject"]
         for text, ans, subject in zip(texts, answers, subjects):
@@ -673,10 +721,7 @@ def evaluate_mmlu_speech(
 
 evaluate_mmlu_speech(
     cfg,
-    model,
-    tokenizer,
-    audio_projector,
-    whisper_encoder,
+    audio_llm,
     whisper_feature_extractor,
     cfg.mmlu_speech_max,
 )
@@ -691,13 +736,10 @@ def transcribe_and_answer(wav_path: str):
         waveform,
         sampling_rate=cfg.sample_rate,
         return_tensors="pt",
-    )["input_features"].to(next(model.parameters()).device)
+    )["input_features"]
     outputs = generate_from_audio_batch(
         cfg,
-        model,
-        tokenizer,
-        audio_projector,
-        whisper_encoder,
+        audio_llm,
         features,
     )
     return outputs[0]

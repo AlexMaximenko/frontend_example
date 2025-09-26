@@ -68,7 +68,7 @@ class CFG:
     assistant_prefix: str = "Answer:"
     sample_rate: int = 16000
     max_duration_s: float = 12.0
-    n_audio_tokens: int = 12
+    audio_subsample: int = 2
     projector_hidden: int = 1024
     train_max_sft_samples: int = 2000
     val_max_sft_samples: int = 200
@@ -172,33 +172,119 @@ def load_frozen_whisper_encoder(cfg: CFG):
 whisper_encoder, whisper_feature_extractor = load_frozen_whisper_encoder(cfg)
 print("Whisper encoder loaded.")
 
-#=== Cell 4: Define AudioProjector (TODO forward)
+#=== Cell 4: Define AudioSubsamplingProjector (TODO forward)
 
 
-class AudioProjector(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, n_tokens: int = 12, hidden_dim: Optional[int] = None):
+class AudioSubsamplingProjector(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        subsample_factor: int = 2,
+        hidden_dim: Optional[int] = None,
+    ):
         super().__init__()
         hidden_dim = hidden_dim or max(input_dim, output_dim)
-        self.n_tokens = n_tokens
-        self.output_dim = output_dim
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, n_tokens * output_dim),
-        )
+        self.subsample_factor = subsample_factor
+        self.proj_in = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.proj_out = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project pooled Whisper encoder states into pseudo tokens."""
-        # TODO: average-pool encoder_hidden_states over time and map through self.net
-        # TODO: reshape to (batch, self.n_tokens, self.output_dim)
-        raise NotImplementedError("TODO: implement AudioProjector.forward")
+        """TODO: subsample encoder_hidden_states along time before projecting."""
+        raise NotImplementedError("TODO: implement AudioSubsamplingProjector.forward")
 
 
-audio_projector = AudioProjector(
+audio_projector = AudioSubsamplingProjector(
     input_dim=whisper_encoder.config.d_model,
     output_dim=model.config.hidden_size,
-    n_tokens=cfg.n_audio_tokens,
+    subsample_factor=cfg.audio_subsample,
     hidden_dim=cfg.projector_hidden,
+)
+
+class AudioLLMModel(nn.Module):
+    def __init__(
+        self,
+        llm: AutoModelForCausalLM,
+        whisper_encoder: WhisperModel,
+        audio_projector: nn.Module,
+        tokenizer,
+        audio_token: str,
+    ):
+        super().__init__()
+        self.llm = llm
+        self.whisper_encoder = whisper_encoder
+        self.audio_projector = audio_projector
+        self.tokenizer = tokenizer
+        self.audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
+
+    def unwrap(self, module: nn.Module) -> nn.Module:
+        return getattr(module, "module", module)
+
+    def _input_embedding_layer(self):
+        return self.unwrap(self.llm).get_input_embeddings()
+
+    def encode_audio(self, input_features: torch.Tensor) -> torch.Tensor:
+        device = next(self.llm.parameters()).device
+        input_features = input_features.to(device)
+        with torch.no_grad():
+            outputs = self.whisper_encoder(input_features)
+        return outputs.last_hidden_state
+
+    def project_audio(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        projected = self.audio_projector(encoder_hidden_states)
+        embed_dtype = self._input_embedding_layer().weight.dtype
+        return projected.to(embed_dtype)
+
+    def trainable_parameters(self):
+        for module in (self.llm, self.audio_projector):
+            for param in module.parameters():
+                if param.requires_grad:
+                    yield param
+
+    def _merge_sequences(
+        self,
+        input_ids: torch.Tensor,
+        token_embeds: torch.Tensor,
+        audio_embeddings: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """TODO: replace SPECIAL_AUDIO tokens with projected audio embeddings."""
+        raise NotImplementedError("TODO: implement AudioLLMModel._merge_sequences")
+
+    def prepare_inputs_and_labels(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """TODO: encode audio, embed text, and build training inputs/labels."""
+        raise NotImplementedError("TODO: implement AudioLLMModel.prepare_inputs_and_labels")
+
+    def prepare_generation_inputs(
+        self,
+        prompts: List[str],
+        audio_features: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """TODO: build inputs_embeds + attention_mask for generation."""
+        raise NotImplementedError("TODO: implement AudioLLMModel.prepare_generation_inputs")
+
+    def generate(
+        self,
+        prompts: List[str],
+        audio_features: torch.Tensor,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        """TODO: call self.unwrap(self.llm).generate with merged audio/text inputs."""
+        raise NotImplementedError("TODO: implement AudioLLMModel.generate")
+
+
+audio_llm = AudioLLMModel(
+    llm=model,
+    whisper_encoder=whisper_encoder,
+    audio_projector=audio_projector,
+    tokenizer=tokenizer,
+    audio_token=SPECIAL_AUDIO_TOKEN,
 )
 
 #=== Cell 5: Dataset loaders with SpokenWOZ + fallbacks
@@ -341,17 +427,12 @@ collator = SFTCollator(tokenizer, cfg)
 
 def make_inputs_embeds_and_labels(
     cfg: CFG,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
 ):
     """Combine audio features with text tokens to build model inputs."""
-    # TODO: encode audio with whisper_encoder (no_grad), project via audio_projector
-    # TODO: replace SPECIAL_AUDIO_TOKEN positions with projected audio tokens
-    # TODO: construct labels using loss_mask (set prompt positions to -100)
+    # TODO: call audio_model.prepare_inputs_and_labels and return its outputs
     raise NotImplementedError("TODO: implement make_inputs_embeds_and_labels")
 
 
@@ -365,7 +446,7 @@ train_loader = DataLoader(
     num_workers=cfg.num_workers,
 )
 optimizer = AdamW(
-    list(model.parameters()) + list(audio_projector.parameters()),
+    list(audio_llm.trainable_parameters()),
     lr=cfg.lr,
     weight_decay=cfg.weight_decay,
 )
@@ -375,15 +456,23 @@ scheduler = get_linear_schedule_with_warmup(
     num_warmup_steps=int(cfg.warmup_ratio * num_training_steps),
     num_training_steps=num_training_steps,
 )
-model, optimizer, train_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, scheduler)
-audio_projector = audio_projector.to(accelerator.device)
-whisper_encoder = whisper_encoder.to(accelerator.device)
+prepared_llm, prepared_projector, optimizer, train_loader, scheduler = accelerator.prepare(
+    audio_llm.llm,
+    audio_llm.audio_projector,
+    optimizer,
+    train_loader,
+    scheduler,
+)
+audio_llm.llm = prepared_llm
+audio_llm.audio_projector = prepared_projector
+audio_llm.whisper_encoder = audio_llm.whisper_encoder.to(accelerator.device)
+audio_llm.whisper_encoder.eval()
 
 
 def train_epoch(epoch: int):
     """Single epoch training with gradient accumulation and AMP."""
-    # TODO: iterate over train_loader, build embeds via make_inputs_embeds_and_labels,
-    #       compute loss, backprop, optimizer/scheduler steps, and log every cfg.logging_steps
+    # TODO: iterate over train_loader, use make_inputs_embeds_and_labels(cfg, audio_llm, ...),
+    #       compute loss with audio_llm.llm, backprop, optimizer/scheduler steps, and log every cfg.logging_steps
     raise NotImplementedError("TODO: implement train_epoch")
 
 
@@ -396,19 +485,35 @@ for epoch in range(cfg.epochs):
 
 #=== Cell 10: MMLU-Speech evaluation (TODO)
 
+def generate_from_audio_batch(
+    cfg: CFG,
+    audio_model: AudioLLMModel,
+    audio_features: torch.Tensor,
+    max_new_tokens: int = 64,
+    temperature: float = 0.0,
+):
+    prompts = []
+    for _ in range(audio_features.size(0)):
+        system = cfg.system_prompt
+        user = cfg.user_prompt_template.replace("<AUDIO>", SPECIAL_AUDIO_TOKEN)
+        prompts.append(f"SYSTEM: {system}\nUSER: {user}\nASSISTANT:")
+
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "do_sample": temperature > 0,
+    }
+    return audio_model.generate(prompts, audio_features, generation_kwargs)
+
 def evaluate_mmlu_speech(
     cfg: CFG,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     feature_extractor,
     max_samples: Optional[int] = None,
 ):
     """Evaluate zero-shot multiple-choice accuracy on mistralai/mmlu_speech."""
     # TODO: iterate over evaluation DataLoader, build prompts with SPECIAL_AUDIO_TOKEN,
-    #       generate answers, parse via regex, compute overall + per-subject accuracy,
-    #       print qualitative examples (10 items).
+    #       call audio_model.generate, parse answers, compute metrics, log qualitative samples.
     raise NotImplementedError("TODO: implement evaluate_mmlu_speech")
 
 

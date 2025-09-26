@@ -81,7 +81,7 @@ class TrainingConfig:
     save_every: int = 200
     resume: Optional[str] = None
     projector_dim: int = 1024
-    n_audio_tokens: int = 12
+    audio_subsample: int = 2
     sample_rate: int = 16000
     max_duration_s: float = 12.0
     warmup_ratio: float = 0.03
@@ -127,7 +127,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--resume", type=str, default=None, help="Path to directory with adapters/audio_projector.pt")
     parser.add_argument("--projector-dim", type=int, default=1024)
-    parser.add_argument("--n-audio-tokens", type=int, default=12)
+    parser.add_argument("--audio-subsample", type=int, default=2)
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--max-duration-s", type=float, default=12.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
@@ -163,7 +163,7 @@ def parse_args() -> TrainingConfig:
         save_every=args.save_every,
         resume=args.resume,
         projector_dim=args.projector_dim,
-        n_audio_tokens=args.n_audio_tokens,
+        audio_subsample=args.audio_subsample,
         sample_rate=args.sample_rate,
         max_duration_s=args.max_duration_s,
         warmup_ratio=args.warmup_ratio,
@@ -259,23 +259,196 @@ def load_frozen_whisper_encoder(cfg: TrainingConfig):
     return whisper.encoder, feature_extractor
 
 
-class AudioProjector(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, n_tokens: int, hidden_dim: int):
+class AudioSubsamplingProjector(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, subsample_factor: int, hidden_dim: int):
         super().__init__()
-        self.n_tokens = n_tokens
+        if subsample_factor < 1:
+            raise ValueError("subsample_factor must be >= 1")
+        self.subsample_factor = subsample_factor
         hidden_dim = hidden_dim or max(input_dim, output_dim)
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, n_tokens * output_dim),
-        )
+        self.proj_in = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.proj_out = nn.Linear(hidden_dim, output_dim)
         self.output_dim = output_dim
 
     def forward(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        pooled = encoder_hidden_states.mean(dim=1)
-        projected = self.net(pooled)
-        projected = projected.view(-1, self.n_tokens, self.output_dim)
-        return projected
+        x = encoder_hidden_states
+        if self.subsample_factor > 1:
+            x = x.transpose(1, 2)
+            x = torch.nn.functional.avg_pool1d(
+                x,
+                kernel_size=self.subsample_factor,
+                stride=self.subsample_factor,
+                ceil_mode=True,
+            )
+            x = x.transpose(1, 2)
+        x = self.proj_out(self.act(self.proj_in(x)))
+        return x
+
+
+class AudioLLMModel(nn.Module):
+    def __init__(
+        self,
+        llm: AutoModelForCausalLM,
+        whisper_encoder: WhisperModel,
+        audio_projector: nn.Module,
+        tokenizer,
+        audio_token: str,
+    ):
+        super().__init__()
+        self.llm = llm
+        self.whisper_encoder = whisper_encoder
+        self.audio_projector = audio_projector
+        self.tokenizer = tokenizer
+        self.audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
+
+    def unwrap(self, module: nn.Module) -> nn.Module:
+        return getattr(module, "module", module)
+
+    def _input_embedding_layer(self):
+        return self.unwrap(self.llm).get_input_embeddings()
+
+    def encode_audio(self, input_features: torch.Tensor) -> torch.Tensor:
+        device = next(self.llm.parameters()).device
+        input_features = input_features.to(device)
+        with torch.no_grad():
+            outputs = self.whisper_encoder(input_features)
+        return outputs.last_hidden_state
+
+    def project_audio(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        projected = self.audio_projector(encoder_hidden_states)
+        embed_dtype = self._input_embedding_layer().weight.dtype
+        return projected.to(embed_dtype)
+
+    def trainable_parameters(self):
+        for module in (self.llm, self.audio_projector):
+            for param in module.parameters():
+                if param.requires_grad:
+                    yield param
+
+    def _merge_sequences(
+        self,
+        input_ids: torch.Tensor,
+        token_embeds: torch.Tensor,
+        audio_embeddings: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        batch_embeds: List[torch.Tensor] = []
+        batch_masks: List[torch.Tensor] = []
+        batch_labels: List[torch.Tensor] = [] if labels is not None else None
+
+        for idx in range(input_ids.size(0)):
+            seq_embeds: List[torch.Tensor] = []
+            seq_mask: List[torch.Tensor] = []
+            seq_labels: List[torch.Tensor] = [] if labels is not None else None
+            audio_seq = audio_embeddings[idx]
+            label_seq = labels[idx] if labels is not None else None
+            audio_inserted = False
+
+            for token_position, (token_id, embed) in enumerate(zip(input_ids[idx], token_embeds[idx])):
+                if token_id.item() == self.audio_token_id:
+                    seq_embeds.append(audio_seq)
+                    seq_mask.append(torch.ones(audio_seq.size(0), device=embed.device, dtype=torch.long))
+                    if labels is not None:
+                        seq_labels.append(
+                            torch.full((audio_seq.size(0),), -100, device=embed.device, dtype=torch.long)
+                        )
+                    audio_inserted = True
+                else:
+                    seq_embeds.append(embed.unsqueeze(0))
+                    seq_mask.append(torch.ones(1, device=embed.device, dtype=torch.long))
+                    if labels is not None:
+                        seq_labels.append(label_seq[token_position].view(1))
+
+            if not audio_inserted:
+                raise ValueError("Input sequence is missing the audio special token.")
+
+            seq_embeds_tensor = torch.cat(seq_embeds, dim=0)
+            seq_mask_tensor = torch.cat(seq_mask, dim=0)
+            batch_embeds.append(seq_embeds_tensor)
+            batch_masks.append(seq_mask_tensor)
+            if labels is not None and seq_labels is not None:
+                seq_labels_tensor = torch.cat(seq_labels, dim=0)
+                batch_labels.append(seq_labels_tensor)
+
+        padded_embeds = torch.nn.utils.rnn.pad_sequence(batch_embeds, batch_first=True)
+        padded_masks = torch.nn.utils.rnn.pad_sequence(batch_masks, batch_first=True)
+        padded_labels = None
+        if batch_labels is not None:
+            padded_labels = torch.nn.utils.rnn.pad_sequence(batch_labels, batch_first=True, padding_value=-100)
+        return padded_embeds, padded_masks, padded_labels
+
+    def prepare_inputs_and_labels(
+        self,
+        batch: Dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_features = batch["input_features"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        loss_mask = batch["loss_mask"].to(device)
+
+        audio_hidden = self.encode_audio(input_features)
+        audio_embeddings = self.project_audio(audio_hidden)
+        embedding_layer = self._input_embedding_layer()
+        token_embeds = embedding_layer(input_ids)
+        labels = input_ids.clone()
+        labels[loss_mask == 0] = -100
+        inputs_embeds, attention_mask, labels = self._merge_sequences(
+            input_ids,
+            token_embeds,
+            audio_embeddings,
+            labels,
+        )
+        return inputs_embeds, attention_mask, labels
+
+    def prepare_generation_inputs(
+        self,
+        prompts: List[str],
+        audio_features: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        encoded = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        ).to(device)
+
+        audio_hidden = self.encode_audio(audio_features.to(device))
+        audio_embeddings = self.project_audio(audio_hidden)
+        token_embeds = self._input_embedding_layer()(encoded.input_ids)
+        inputs_embeds, attention_mask, _ = self._merge_sequences(
+            encoded.input_ids,
+            token_embeds,
+            audio_embeddings,
+        )
+        return inputs_embeds, attention_mask
+
+    def generate(
+        self,
+        prompts: List[str],
+        audio_features: torch.Tensor,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        generation_kwargs = generation_kwargs or {}
+        model = self.unwrap(self.llm)
+        device = next(self.llm.parameters()).device
+        inputs_embeds, attention_mask = self.prepare_generation_inputs(
+            prompts,
+            audio_features,
+            device,
+        )
+        default_kwargs = {
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        default_kwargs.update(generation_kwargs)
+        outputs = model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **default_kwargs,
+        )
+        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
 
 # ---------------------------------------------------------------------------
@@ -415,71 +588,11 @@ class SFTCollator:
 
 def make_inputs_embeds_and_labels(
     cfg: TrainingConfig,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
 ):
-    input_features = batch["input_features"].to(device)
-    input_ids = batch["input_ids"].to(device)
-    loss_mask = batch["loss_mask"].to(device)
-
-    with torch.no_grad():
-        whisper_outputs = whisper_encoder(input_features)
-        audio_hidden = whisper_outputs.last_hidden_state
-    audio_tokens = audio_projector(audio_hidden)
-
-    token_embeds = model.get_input_embeddings()(input_ids)
-    audio_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_AUDIO_TOKEN)
-
-    expanded_embeds = []
-    expanded_labels = []
-    expanded_masks = []
-    for b in range(input_ids.size(0)):
-        ids = input_ids[b]
-        embeds = token_embeds[b]
-        labels = ids.clone()
-        labels[loss_mask[b] == 0] = -100
-        seq_embeds: List[torch.Tensor] = []
-        seq_labels: List[torch.Tensor] = []
-        seq_mask: List[torch.Tensor] = []
-        inserted = 0
-        for idx, (token_id, token_embed, label_val) in enumerate(zip(ids, embeds, labels)):
-            if token_id == audio_token_id:
-                for j in range(audio_projector.n_audio_tokens):
-                    seq_embeds.append(audio_tokens[b, j])
-                    seq_labels.append(torch.tensor(-100, device=device))
-                    seq_mask.append(torch.tensor(1, device=device))
-                inserted += 1
-            else:
-                seq_embeds.append(token_embed)
-                seq_labels.append(label_val)
-                seq_mask.append(torch.tensor(1, device=device))
-        seq_embeds = torch.stack(seq_embeds)
-        seq_labels = torch.stack(seq_labels)
-        seq_mask = torch.stack(seq_mask)
-        expanded_embeds.append(seq_embeds)
-        expanded_labels.append(seq_labels)
-        expanded_masks.append(seq_mask)
-
-    max_len = max(t.size(0) for t in expanded_embeds)
-    padded_embeds, padded_labels, padded_masks = [], [], []
-    for embeds, labels, mask in zip(expanded_embeds, expanded_labels, expanded_masks):
-        pad_len = max_len - embeds.size(0)
-        if pad_len > 0:
-            embeds = torch.cat([embeds, torch.zeros((pad_len, embeds.size(1)), device=device)], dim=0)
-            labels = torch.cat([labels, torch.full((pad_len,), -100, device=device, dtype=torch.long)])
-            mask = torch.cat([mask, torch.zeros(pad_len, device=device)], dim=0)
-        padded_embeds.append(embeds)
-        padded_labels.append(labels)
-        padded_masks.append(mask)
-
-    inputs_embeds = torch.stack(padded_embeds)
-    attention_mask = torch.stack(padded_masks)
-    labels = torch.stack(padded_labels)
-    return inputs_embeds, attention_mask, labels
+    return audio_model.prepare_inputs_and_labels(batch, device)
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +602,7 @@ def make_inputs_embeds_and_labels(
 
 def train_epoch(
     cfg: TrainingConfig,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler,
@@ -500,24 +610,21 @@ def train_epoch(
     epoch: int,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
 ):
-    model.train()
-    audio_projector.train()
+    audio_model.llm.train()
+    audio_model.audio_projector.train()
     total_loss = 0.0
     step = 0
 
     for batch_idx, batch in enumerate(dataloader):
         inputs_embeds, attention_mask, labels = make_inputs_embeds_and_labels(
             cfg,
-            model,
-            tokenizer,
-            audio_projector,
-            whisper_encoder,
+            audio_model,
             batch,
             device,
         )
 
         with torch.cuda.amp.autocast(enabled=cfg.amp and device.type == "cuda"):
-            outputs = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
+            outputs = audio_model.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss / cfg.grad_accum
 
         if scaler is not None:
@@ -529,8 +636,8 @@ def train_epoch(
             if scaler is not None:
                 scaler.unscale_(optimizer)
             if cfg.clip_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm)
-                torch.nn.utils.clip_grad_norm_(audio_projector.parameters(), cfg.clip_grad_norm)
+                torch.nn.utils.clip_grad_norm_(audio_model.llm.parameters(), cfg.clip_grad_norm)
+                torch.nn.utils.clip_grad_norm_(audio_model.audio_projector.parameters(), cfg.clip_grad_norm)
             if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
@@ -547,7 +654,7 @@ def train_epoch(
     return total_loss / max(step, 1)
 
 
-def run_training(cfg: TrainingConfig, model, tokenizer, audio_projector, whisper_encoder, train_dataset):
+def run_training(cfg: TrainingConfig, audio_model: AudioLLMModel, tokenizer, train_dataset):
     sampler = None
     if cfg.ddp and dist.is_initialized():
         sampler = DistributedSampler(train_dataset, shuffle=True)
@@ -562,7 +669,7 @@ def run_training(cfg: TrainingConfig, model, tokenizer, audio_projector, whisper
     )
 
     optimizer = AdamW(
-        list(model.parameters()) + list(audio_projector.parameters()),
+        list(audio_model.trainable_parameters()),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
@@ -574,7 +681,7 @@ def run_training(cfg: TrainingConfig, model, tokenizer, audio_projector, whisper
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and torch.cuda.is_available())
-    device = next(model.parameters()).device
+    device = next(audio_model.llm.parameters()).device
 
     global_step = 0
     best_loss = float("inf")
@@ -583,10 +690,7 @@ def run_training(cfg: TrainingConfig, model, tokenizer, audio_projector, whisper
             sampler.set_epoch(epoch)
         avg_loss = train_epoch(
             cfg,
-            model,
-            tokenizer,
-            audio_projector,
-            whisper_encoder,
+            audio_model,
             dataloader,
             optimizer,
             scheduler,
@@ -599,7 +703,7 @@ def run_training(cfg: TrainingConfig, model, tokenizer, audio_projector, whisper
         best_loss = min(best_loss, avg_loss)
         global_step += len(dataloader)
         if is_main_process():
-            save_checkpoint(cfg, model, audio_projector, global_step, avg_loss, best_loss)
+            save_checkpoint(cfg, audio_model, global_step, avg_loss, best_loss)
     return best_loss
 
 
@@ -610,78 +714,29 @@ def run_training(cfg: TrainingConfig, model, tokenizer, audio_projector, whisper
 
 def generate_from_audio_batch(
     cfg: TrainingConfig,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     audio_features: torch.Tensor,
     max_new_tokens: int = 64,
     temperature: float = 0.0,
 ):
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        whisper_outputs = whisper_encoder(audio_features.to(device))
-        audio_hidden = whisper_outputs.last_hidden_state
-    audio_tokens = audio_projector(audio_hidden)
-
     prompts = []
     for _ in range(audio_features.size(0)):
         system = cfg.system_prompt
         user = cfg.user_template.replace("<AUDIO>", SPECIAL_AUDIO_TOKEN)
         prompts.append(f"SYSTEM: {system}\nUSER: {user}\nASSISTANT:")
 
-    encoded = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
-    token_embeds = model.get_input_embeddings()(encoded.input_ids)
-    audio_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_AUDIO_TOKEN)
-
-    embeds_list = []
-    mask_list = []
-    for b in range(encoded.input_ids.size(0)):
-        ids = encoded.input_ids[b]
-        embeds = token_embeds[b]
-        seq = []
-        for token_id, token_embed in zip(ids, embeds):
-            if token_id == audio_token_id:
-                seq.append(audio_tokens[b])
-            else:
-                seq.append(token_embed.unsqueeze(0))
-        seq = torch.cat(seq, dim=0)
-        embeds_list.append(seq)
-        mask_list.append(torch.ones(seq.size(0), device=device))
-
-    max_len = max(t.size(0) for t in embeds_list)
-    padded_embeds = []
-    padded_masks = []
-    for embeds, mask in zip(embeds_list, mask_list):
-        pad_len = max_len - embeds.size(0)
-        if pad_len > 0:
-            embeds = torch.cat([embeds, torch.zeros((pad_len, embeds.size(1)), device=device)], dim=0)
-            mask = torch.cat([mask, torch.zeros(pad_len, device=device)], dim=0)
-        padded_embeds.append(embeds)
-        padded_masks.append(mask)
-
-    inputs_embeds = torch.stack(padded_embeds)
-    attention_mask = torch.stack(padded_masks)
-
-    outputs = model.generate(
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        do_sample=temperature > 0,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "do_sample": temperature > 0,
+    }
+    texts = audio_model.generate(prompts, audio_features, generation_kwargs)
     return texts
 
 
 def evaluate_mmlu_speech(
     cfg: TrainingConfig,
-    model: AutoModelForCausalLM,
-    tokenizer,
-    audio_projector: AudioProjector,
-    whisper_encoder,
+    audio_model: AudioLLMModel,
     feature_extractor,
     max_samples: Optional[int] = None,
 ):
@@ -690,7 +745,6 @@ def evaluate_mmlu_speech(
         dataset = dataset.select(range(min(len(dataset), max_samples)))
 
     dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
-    device = next(model.parameters()).device
 
     total = 0
     correct = 0
@@ -706,64 +760,27 @@ def evaluate_mmlu_speech(
                 sampling_rate=cfg.sample_rate,
                 return_tensors="pt",
             )["input_features"][0]
-            audio_list.append(feats)
-        audio_tensor = torch.stack(audio_list).to(device)
-        with torch.no_grad():
-            whisper_outputs = whisper_encoder(audio_tensor)
-            audio_hidden = whisper_outputs.last_hidden_state
-        audio_tokens = audio_projector(audio_hidden)
+            audio_list.append(feats.to(torch.float32))
+        audio_tensor = torch.stack(audio_list)
 
         prompts = []
         prefix = "Listen to the audio question and select the correct answer (A/B/C/D). Return just the letter."
         for _ in range(audio_tensor.size(0)):
             prompts.append(
-                f"SYSTEM: {cfg.system_prompt}\nUSER: {SPECIAL_AUDIO_TOKEN} {prefix} Select the correct option: A, B, C, or D. Reply with one letter.\nASSISTANT:"
+                f"SYSTEM: {cfg.system_prompt}
+USER: {SPECIAL_AUDIO_TOKEN} {prefix} Select the correct option: A, B, C, or D. Reply with one letter.
+ASSISTANT:"
             )
 
-        encoded = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
-        token_embeds = model.get_input_embeddings()(encoded.input_ids)
-        audio_token_id = tokenizer.convert_tokens_to_ids(SPECIAL_AUDIO_TOKEN)
-
-        embeds_list = []
-        mask_list = []
-        for b in range(encoded.input_ids.size(0)):
-            ids = encoded.input_ids[b]
-            embeds = token_embeds[b]
-            seq = []
-            for token_id, token_embed in zip(ids, embeds):
-                if token_id == audio_token_id:
-                    seq.append(audio_tokens[b])
-                else:
-                    seq.append(token_embed.unsqueeze(0))
-            seq = torch.cat(seq, dim=0)
-            embeds_list.append(seq)
-            mask_list.append(torch.ones(seq.size(0), device=device))
-
-        max_len = max(t.size(0) for t in embeds_list)
-        padded_embeds = []
-        padded_masks = []
-        for embeds, mask in zip(embeds_list, mask_list):
-            pad_len = max_len - embeds.size(0)
-            if pad_len > 0:
-                embeds = torch.cat([embeds, torch.zeros((pad_len, embeds.size(1)), device=device)], dim=0)
-                mask = torch.cat([mask, torch.zeros(pad_len, device=device)], dim=0)
-            padded_embeds.append(embeds)
-            padded_masks.append(mask)
-
-        inputs_embeds = torch.stack(padded_embeds)
-        attention_mask = torch.stack(padded_masks)
-
-        outputs = model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=8,
-            temperature=0.0,
+        texts = audio_model.generate(
+            prompts,
+            audio_tensor,
+            {"max_new_tokens": 8, "temperature": 0.0, "do_sample": False},
         )
-        texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         answers = batch["answer"]
         subjects = batch["subject"]
         for text, ans, subject in zip(texts, answers, subjects):
-            match = re.search(r"\b([ABCD])\b", text.strip().upper())
+            match = re.search(r"([ABCD])", text.strip().upper())
             pred = match.group(1) if match else ""
             total += 1
             stats = per_subject.setdefault(subject, {"correct": 0, "total": 0})
@@ -771,7 +788,7 @@ def evaluate_mmlu_speech(
             if pred == ans:
                 correct += 1
                 stats["correct"] += 1
-            if len(qualitative) < 10 and is_main_process():
+            if len(qualitative) < 10:
                 qualitative.append({"subject": subject, "prediction": pred, "gold": ans, "raw": text})
 
     overall = correct / max(total, 1)
@@ -789,21 +806,23 @@ def evaluate_mmlu_speech(
     return overall, subject_scores, qualitative
 
 
+
 # ---------------------------------------------------------------------------
 # Checkpointing & Resume
 # ---------------------------------------------------------------------------
 
 
-def save_checkpoint(cfg: TrainingConfig, model, audio_projector, global_step: int, loss: float, best_loss: float):
+def save_checkpoint(cfg: TrainingConfig, audio_model: AudioLLMModel, global_step: int, loss: float, best_loss: float):
     if not is_main_process():
         return
     os.makedirs(cfg.output_dir, exist_ok=True)
     adapter_dir = Path(cfg.output_dir) / "adapters"
     projector_path = Path(cfg.output_dir) / "audio_projector.pt"
     adapter_dir.mkdir(parents=True, exist_ok=True)
-    model_to_save = model.module if isinstance(model, DDP) else model
+    model_to_save = audio_model.unwrap(audio_model.llm)
     model_to_save.save_pretrained(str(adapter_dir))
-    torch.save(audio_projector.state_dict(), projector_path)
+    projector_to_save = audio_model.unwrap(audio_model.audio_projector)
+    torch.save(projector_to_save.state_dict(), projector_path)
     if cfg.save_state:
         state_path = Path(cfg.output_dir) / "training_state.json"
         with open(state_path, "w", encoding="utf-8") as f:
@@ -812,18 +831,20 @@ def save_checkpoint(cfg: TrainingConfig, model, audio_projector, global_step: in
         print(f"Saved checkpoint to {cfg.output_dir}")
 
 
-def load_resume(cfg: TrainingConfig, model, audio_projector):
+def load_resume(cfg: TrainingConfig, audio_model: AudioLLMModel):
     if cfg.resume is None:
         return
     adapter_dir = Path(cfg.resume)
     projector_path = adapter_dir / "audio_projector.pt"
     adapter_subdir = adapter_dir / "adapters"
     if adapter_subdir.exists():
-        model.load_adapter(str(adapter_subdir), adapter_name="default", is_trainable=True)
-        model.set_adapter("default")
+        base_model = audio_model.unwrap(audio_model.llm)
+        base_model.load_adapter(str(adapter_subdir), adapter_name="default", is_trainable=True)
+        base_model.set_adapter("default")
     if projector_path.exists():
         state = torch.load(projector_path, map_location="cpu")
-        audio_projector.load_state_dict(state)
+        target_projector = audio_model.unwrap(audio_model.audio_projector)
+        target_projector.load_state_dict(state)
     if is_main_process():
         print(f"Resumed from {cfg.resume}")
 
@@ -833,8 +854,7 @@ def load_resume(cfg: TrainingConfig, model, audio_projector):
 # ---------------------------------------------------------------------------
 
 
-def infer_from_audio(cfg: TrainingConfig, model, tokenizer, audio_projector, whisper_encoder, feature_extractor, path: str):
-    device = next(model.parameters()).device
+def infer_from_audio(cfg: TrainingConfig, audio_model: AudioLLMModel, feature_extractor, path: str):
     waveform, sr = sf.read(path)
     if sr != cfg.sample_rate:
         waveform = torchaudio.functional.resample(torch.tensor(waveform).float(), sr, cfg.sample_rate).numpy()
@@ -842,8 +862,8 @@ def infer_from_audio(cfg: TrainingConfig, model, tokenizer, audio_projector, whi
         waveform,
         sampling_rate=cfg.sample_rate,
         return_tensors="pt",
-    )["input_features"].to(device)
-    texts = generate_from_audio_batch(cfg, model, tokenizer, audio_projector, whisper_encoder, features)
+    )["input_features"].to(torch.float32)
+    texts = generate_from_audio_batch(cfg, audio_model, features)
     if is_main_process():
         print("Inference output:", texts[0])
     return texts[0]
@@ -865,22 +885,39 @@ def main():
 
     model, tokenizer = load_llm_and_tokenizer(cfg)
     whisper_encoder, feature_extractor = load_frozen_whisper_encoder(cfg)
-    audio_projector = AudioProjector(
+    audio_projector = AudioSubsamplingProjector(
         input_dim=whisper_encoder.config.d_model,
         output_dim=model.config.hidden_size,
-        n_tokens=cfg.n_audio_tokens,
+        subsample_factor=cfg.audio_subsample,
         hidden_dim=cfg.projector_dim,
+    )
+    audio_model = AudioLLMModel(
+        llm=model,
+        whisper_encoder=whisper_encoder,
+        audio_projector=audio_projector,
+        tokenizer=tokenizer,
+        audio_token=SPECIAL_AUDIO_TOKEN,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    audio_projector = audio_projector.to(device)
-    whisper_encoder = whisper_encoder.to(device)
+    audio_model.llm = audio_model.llm.to(device)
+    audio_model.audio_projector = audio_model.audio_projector.to(device)
+    audio_model.whisper_encoder = audio_model.whisper_encoder.to(device)
+    audio_model.whisper_encoder.eval()
 
-    load_resume(cfg, model, audio_projector)
+    if cfg.ddp and dist.is_initialized():
+        local_rank = int(os.environ.get("LOCAL_RANK", dist.get_rank()))
+        audio_model.llm = DDP(audio_model.llm, device_ids=[local_rank], find_unused_parameters=cfg.ddp_find_unused)
+        audio_model.audio_projector = DDP(
+            audio_model.audio_projector,
+            device_ids=[local_rank],
+            find_unused_parameters=cfg.ddp_find_unused,
+        )
+
+    load_resume(cfg, audio_model)
 
     if cfg.infer_audio:
-        infer_from_audio(cfg, model, tokenizer, audio_projector, whisper_encoder, feature_extractor, cfg.infer_audio)
+        infer_from_audio(cfg, audio_model, feature_extractor, cfg.infer_audio)
         if cfg.ddp and dist.is_initialized():
             dist.barrier()
         return
@@ -890,15 +927,12 @@ def main():
         train_dataset = train_dataset.select(range(min(len(train_dataset), cfg.train_max_samples)))
 
     if cfg.epochs > 0:
-        run_training(cfg, model, tokenizer, audio_projector, whisper_encoder, train_dataset)
+        run_training(cfg, audio_model, tokenizer, train_dataset)
 
     if cfg.eval_mmlu:
         overall, subject_scores, qualitative = evaluate_mmlu_speech(
             cfg,
-            model,
-            tokenizer,
-            audio_projector,
-            whisper_encoder,
+            audio_model,
             feature_extractor,
             max_samples=cfg.mmlu_max,
         )
